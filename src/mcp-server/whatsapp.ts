@@ -6,8 +6,18 @@ import makeWASocket, {
 import type { WASocket, WAMessage, GroupMetadata } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { join, dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
 import { format } from 'date-fns';
+import qrcode from 'qrcode-terminal';
+import {
+  loadPolicy,
+  isGroupJid,
+  resolveAllowedJids,
+  unmatchedEntries,
+  describePolicy,
+  type Policy,
+} from './policy.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -144,8 +154,36 @@ class MessageBuffer {
   private snapshotInterval: NodeJS.Timeout | null = null;
   private _lastUpsertTs = 0;
 
+  // Set of group JIDs the policy allows. `null` until the allowlist has been
+  // resolved against the live group list. Before resolution, group messages
+  // are accepted (and purged on resolution); non-group JIDs are never stored.
+  private allowedJids: Set<string> | null = null;
+
   constructor(authDir: string) {
     this.snapshotPath = join(authDir, 'buffer.json');
+  }
+
+  get allowed(): Set<string> | null {
+    return this.allowedJids;
+  }
+
+  isAllowedJid(jid: string): boolean {
+    if (!isGroupJid(jid)) return false;
+    if (this.allowedJids === null) return true;
+    return this.allowedJids.has(jid);
+  }
+
+  /** Apply a resolved allowlist and drop every buffer outside it. */
+  setAllowedJids(allowed: Set<string>): void {
+    this.allowedJids = allowed;
+    let dropped = 0;
+    for (const jid of [...this.buffers.keys()]) {
+      if (!allowed.has(jid)) {
+        this.buffers.delete(jid);
+        dropped++;
+      }
+    }
+    if (dropped > 0) log('info', `Buffer purge: dropped ${dropped} chats outside the allowlist`);
   }
 
   get lastUpsertTs(): number {
@@ -168,6 +206,7 @@ class MessageBuffer {
       const raw = readFileSync(this.snapshotPath, 'utf-8');
       const data: Record<string, BufferEntry[]> = JSON.parse(raw);
       for (const [jid, entries] of Object.entries(data)) {
+        if (!isGroupJid(jid)) continue; // never rehydrate personal chats
         this.buffers.set(jid, entries.slice(-this.maxPerGroup));
       }
       log('info', `Buffer rehydrated: ${this.totalSize} messages across ${this.groupCount} groups`);
@@ -179,6 +218,7 @@ class MessageBuffer {
   }
 
   upsert(jid: string, entries: BufferEntry[]): void {
+    if (!this.isAllowedJid(jid)) return;
     let buf = this.buffers.get(jid);
     if (!buf) {
       buf = [];
@@ -225,6 +265,7 @@ class MessageBuffer {
 
     const jids = jid ? [jid] : [...this.buffers.keys()];
     for (const j of jids) {
+      if (!this.isAllowedJid(j)) continue;
       const buf = this.buffers.get(j) || [];
       for (const entry of buf) {
         if (entry.body.toLowerCase().includes(lowerQuery)) {
@@ -316,12 +357,36 @@ export class WhatsAppClient {
   private readyResolve: (() => void) | null = null;
   private destroying = false;
   private saveCreds: (() => Promise<void>) | null = null;
+  private readonly policy: Policy;
+  private readonly authDir: string;
+  private allowlistResolved = false;
 
-  private static readonly AUTH_DIR = '.baileys_auth';
   private static readonly BAILEYS_LOGGER = pino({ level: 'silent' }, pino.destination(2));
 
-  constructor(private readonly sessionName: string) {
-    this.buffer = new MessageBuffer(WhatsAppClient.AUTH_DIR);
+  // Auth state lives next to the repo, not in the caller's cwd: an MCP host
+  // may spawn this server from any directory.
+  private static defaultAuthDir(sessionName: string): string {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const repoRoot = resolve(here, '..', '..');
+    return join(repoRoot, `.baileys_auth-${sessionName}`);
+  }
+
+  constructor(private readonly sessionName: string, policy?: Policy) {
+    this.policy = policy ?? loadPolicy();
+    this.authDir = process.env.WHATSAPP_AUTH_DIR
+      ? resolve(process.env.WHATSAPP_AUTH_DIR)
+      : WhatsAppClient.defaultAuthDir(sessionName);
+    this.buffer = new MessageBuffer(this.authDir);
+    log('info', `Policy: ${describePolicy(this.policy)}`);
+    log('info', `Auth dir: ${this.authDir}`);
+  }
+
+  getPolicy(): Policy {
+    return this.policy;
+  }
+
+  isReadOnly(): boolean {
+    return this.policy.readOnly;
   }
 
   // -----------------------------------------------------------------------
@@ -337,6 +402,7 @@ export class WhatsAppClient {
     await this.createSocket();
     await this.waitForReady();
 
+    await this.refreshAllowedJids();
     this.buffer.startPeriodicSnapshot();
     log(
       'info',
@@ -345,7 +411,7 @@ export class WhatsAppClient {
   }
 
   private async createSocket(): Promise<void> {
-    const { state, saveCreds } = await useMultiFileAuthState(WhatsAppClient.AUTH_DIR);
+    const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
     this.saveCreds = saveCreds;
 
     const { version } = await fetchLatestBaileysVersion();
@@ -387,9 +453,43 @@ export class WhatsAppClient {
   // Groups
   // -----------------------------------------------------------------------
 
-  async getGroups(): Promise<WhatsAppGroupSummary[]> {
+  /**
+   * Every group on the account, ignoring the allowlist. Not reachable from
+   * any MCP tool: only the pairing script uses it so the user can pick
+   * which groups to allow.
+   */
+  async getAllGroupsUnfiltered(): Promise<WhatsAppGroupSummary[]> {
     this.ensureReady();
-    return this.mutex.run(async () => {
+    return this.mutex.run(() => this.fetchGroupSummaries());
+  }
+
+  /** Fetch the live group list and refresh the buffer's allowed-JID set. */
+  private async refreshAllowedJids(): Promise<void> {
+    try {
+      const all = await this.mutex.run(() => this.fetchGroupSummaries());
+      const allowed = resolveAllowedJids(all, this.policy.allowlist);
+      this.buffer.setAllowedJids(allowed);
+      this.allowlistResolved = true;
+      const missing = unmatchedEntries(all, this.policy.allowlist);
+      log(
+        'info',
+        `Allowlist resolved: ${allowed.size} of ${all.length} groups exposed` +
+          (missing.length ? `; unmatched entries: ${missing.map((m) => `"${m}"`).join(', ')}` : ''),
+      );
+    } catch (err) {
+      log('error', 'Allowlist resolution failed; buffer stays fail-closed', err);
+      if (!this.allowlistResolved) this.buffer.setAllowedJids(new Set());
+    }
+  }
+
+  private assertAllowed(groupId: string): void {
+    const allowed = this.buffer.allowed;
+    if (!allowed || !allowed.has(groupId)) {
+      throw new Error(`Group ${groupId} is not in WHATSAPP_GROUP_ALLOWLIST`);
+    }
+  }
+
+  private async fetchGroupSummaries(): Promise<WhatsAppGroupSummary[]> {
       log('info', 'getGroups: fetching participating groups...');
       const groups = await this.sock!.groupFetchAllParticipating();
 
@@ -411,11 +511,22 @@ export class WhatsAppClient {
       const filtered = dedupeAndFilterGroups(summaries);
       log(
         'info',
-        `getGroups: returning ${filtered.length} groups ` +
+        `getGroups: ${filtered.length} groups ` +
           `(${summaries.length - filtered.length} phantom/duplicate entries filtered)`,
       );
       return filtered;
-    });
+  }
+
+  /** Groups visible to MCP tools: the live list intersected with the allowlist. */
+  async getGroups(): Promise<WhatsAppGroupSummary[]> {
+    this.ensureReady();
+    const all = await this.mutex.run(() => this.fetchGroupSummaries());
+    const allowed = resolveAllowedJids(all, this.policy.allowlist);
+    this.buffer.setAllowedJids(allowed);
+    this.allowlistResolved = true;
+    const visible = all.filter((g) => allowed.has(g.id));
+    log('info', `getGroups: returning ${visible.length} allowlisted groups`);
+    return visible;
   }
 
   async getGroupMessages(
@@ -423,6 +534,7 @@ export class WhatsAppClient {
     options: GetMessagesOptions = {},
   ): Promise<WhatsAppMessageEntry[]> {
     this.ensureReady();
+    this.assertAllowed(groupId);
     const { limit = 200, after, before } = options;
     log('info', `getGroupMessages: groupId=${groupId}, limit=${limit}`);
 
@@ -445,6 +557,7 @@ export class WhatsAppClient {
 
   async getGroupInfo(groupId: string): Promise<WhatsAppGroupInfo> {
     this.ensureReady();
+    this.assertAllowed(groupId);
     return this.mutex.run(async () => {
       log('info', `getGroupInfo: groupId=${groupId}`);
       const meta = await this.sock!.groupMetadata(groupId);
@@ -479,6 +592,7 @@ export class WhatsAppClient {
     limit = 50,
   ): Promise<WhatsAppMessageEntry[]> {
     this.ensureReady();
+    if (groupId) this.assertAllowed(groupId);
     log('info', `searchMessages: query="${query}", groupId=${groupId ?? 'all'}, limit=${limit}`);
 
     const entries = this.buffer.search(query, groupId, limit);
@@ -504,6 +618,7 @@ export class WhatsAppClient {
 
   async exportChat(groupId: string, limit = 500): Promise<string> {
     this.ensureReady();
+    this.assertAllowed(groupId);
     log('info', `exportChat: groupId=${groupId}, limit=${limit}`);
 
     const entries = this.buffer.get(groupId, limit);
@@ -535,6 +650,10 @@ export class WhatsAppClient {
     quotedMessageId?: string,
   ): Promise<{ id: string; timestamp: number }> {
     this.ensureReady();
+    if (this.policy.readOnly) {
+      throw new Error('Sending is disabled: WHATSAPP_READ_ONLY is true');
+    }
+    this.assertAllowed(chatId);
     return this.mutex.run(async () => {
       log(
         'info',
@@ -611,11 +730,24 @@ export class WhatsAppClient {
       },
     );
 
-    this.sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+    this.sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+      if (qr) {
+        // First run only: Baileys no longer prints the QR itself.
+        process.stderr.write('\n[whatsapp-client] Scan this QR with WhatsApp > Linked devices > Link a device:\n\n');
+        qrcode.generate(qr, { small: true }, (ascii: string) => {
+          process.stderr.write(ascii + '\n');
+        });
+      }
       if (connection === 'open') {
         log('info', 'Connection open');
         this.connectionOpen = true;
         if (this.bufferWarm) this.tryMarkReady();
+        if (this.allowlistResolved) {
+          // Reconnect: group membership may have changed while we were away.
+          this.refreshAllowedJids().catch((err) =>
+            log('warn', 'Allowlist refresh after reconnect failed', err),
+          );
+        }
       } else if (connection === 'close') {
         this.connectionOpen = false;
         this.ready = false;
@@ -785,10 +917,10 @@ export class WhatsAppClient {
 
 const instances = new Map<string, WhatsAppClient>();
 
-export function getWhatsAppClient(sessionName = 'default'): WhatsAppClient {
+export function getWhatsAppClient(sessionName = 'default', policy?: Policy): WhatsAppClient {
   let instance = instances.get(sessionName);
   if (!instance) {
-    instance = new WhatsAppClient(sessionName);
+    instance = new WhatsAppClient(sessionName, policy);
     instances.set(sessionName, instance);
   }
   return instance;

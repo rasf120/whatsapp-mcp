@@ -82,7 +82,28 @@ npm install
 npm run build
 ```
 
+### Access policy (this fork)
+
+This fork is fail-closed. Two environment variables control what the server exposes:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `WHATSAPP_GROUP_ALLOWLIST` | empty | Pipe-separated group names or JIDs. Only these groups are listed, readable, searchable, or buffered to disk. Empty means no groups at all. Names match case- and punctuation-insensitively; JIDs match exactly; there is no substring matching. |
+| `WHATSAPP_READ_ONLY` | `true` | When true the `whatsapp_send_message` and `whatsapp_reply_to_message` tools are not registered and are refused if called anyway. Only the literal string `false` enables sending. |
+
+Personal (non-group) chats are never written to the message buffer regardless of settings. Groups outside the allowlist are purged from the buffer as soon as the allowlist is resolved against the live group list, and again on every reconnect.
+
+Auth state and the buffer live in `.baileys_auth-<session>/` next to this repo (override with `WHATSAPP_AUTH_DIR`), so the server works no matter which directory the MCP host starts it from.
+
 ### First Run — QR Pairing
+
+```bash
+npm run pair
+```
+
+`pair` links the device (QR on first run), prints every group on the account with its JID, marks the ones the current allowlist matches, and exits. Use it to pick the names for `WHATSAPP_GROUP_ALLOWLIST`. It is the only code path that lists groups outside the allowlist, and it is not reachable through MCP.
+
+Or, without the group listing:
 
 ```bash
 WHATSAPP_SESSION_NAME=my-session node dist/mcp-server/index.js
@@ -101,7 +122,9 @@ Add to `~/.claude.json`:
       "command": "node",
       "args": ["/path/to/whatsapp-mcp-server/dist/mcp-server/index.js"],
       "env": {
-        "WHATSAPP_SESSION_NAME": "my-session"
+        "WHATSAPP_SESSION_NAME": "my-session",
+        "WHATSAPP_GROUP_ALLOWLIST": "Group One|Group Two",
+        "WHATSAPP_READ_ONLY": "true"
       }
     }
   }

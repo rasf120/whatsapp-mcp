@@ -150,7 +150,7 @@ export async function resolveGroupOrError(
   return {
     error: {
       type: 'text' as const,
-      text: `No group found matching "${groupName}". Available groups: ${available}`,
+      text: `No group found matching "${groupName}". Allowlisted groups: ${available || '(none — WHATSAPP_GROUP_ALLOWLIST is empty or matched nothing)'}`,
     },
   };
 }
@@ -158,12 +158,59 @@ export async function resolveGroupOrError(
 // ── Tool Registration ───────────────────────────────────────────────────────
 
 export function registerTools(server: Server, client: WhatsAppClient): void {
+  const readOnly = client.isReadOnly();
+
+  const writeTools = [
+      {
+        name: 'whatsapp_send_message',
+        description:
+          'Send a message to a WhatsApp group, addressed by name or exact JID. If the name matches more than one group, the send is refused and the matching JIDs are returned instead of guessing.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            groupName: {
+              type: 'string',
+              description: 'Group name (fuzzy-matched) or exact group JID (e.g. 12036...@g.us). If the name matches multiple groups, the call fails and returns the JIDs to disambiguate.',
+            },
+            message: {
+              type: 'string',
+              description: 'Message text to send',
+            },
+          },
+          required: ['groupName', 'message'],
+        },
+      },
+      {
+        name: 'whatsapp_reply_to_message',
+        description:
+          'Reply to a specific message in a WhatsApp group. The reply will be shown as a quoted reply.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            groupName: {
+              type: 'string',
+              description: 'Group name (fuzzy-matched) or exact group JID (e.g. 12036...@g.us). If the name matches multiple groups, the call fails and returns the JIDs to disambiguate.',
+            },
+            messageId: {
+              type: 'string',
+              description: 'The ID of the message to reply to (from whatsapp_get_messages)',
+            },
+            message: {
+              type: 'string',
+              description: 'Reply text to send',
+            },
+          },
+          required: ['groupName', 'messageId', 'message'],
+        },
+      },
+  ];
+
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
         name: 'whatsapp_list_groups',
         description:
-          'List all WhatsApp groups the authenticated user belongs to, sorted by most recent activity.',
+          'List the WhatsApp groups exposed by the server allowlist (WHATSAPP_GROUP_ALLOWLIST), sorted by most recent activity. Groups outside the allowlist are never visible.',
         inputSchema: {
           type: 'object' as const,
           properties: {},
@@ -257,53 +304,19 @@ export function registerTools(server: Server, client: WhatsAppClient): void {
           required: ['groupName'],
         },
       },
-      {
-        name: 'whatsapp_send_message',
-        description:
-          'Send a message to a WhatsApp group, addressed by name or exact JID. If the name matches more than one group, the send is refused and the matching JIDs are returned instead of guessing.',
-        inputSchema: {
-          type: 'object' as const,
-          properties: {
-            groupName: {
-              type: 'string',
-              description: 'Group name (fuzzy-matched) or exact group JID (e.g. 12036...@g.us). If the name matches multiple groups, the call fails and returns the JIDs to disambiguate.',
-            },
-            message: {
-              type: 'string',
-              description: 'Message text to send',
-            },
-          },
-          required: ['groupName', 'message'],
-        },
-      },
-      {
-        name: 'whatsapp_reply_to_message',
-        description:
-          'Reply to a specific message in a WhatsApp group. The reply will be shown as a quoted reply.',
-        inputSchema: {
-          type: 'object' as const,
-          properties: {
-            groupName: {
-              type: 'string',
-              description: 'Group name (fuzzy-matched) or exact group JID (e.g. 12036...@g.us). If the name matches multiple groups, the call fails and returns the JIDs to disambiguate.',
-            },
-            messageId: {
-              type: 'string',
-              description: 'The ID of the message to reply to (from whatsapp_get_messages)',
-            },
-            message: {
-              type: 'string',
-              description: 'Reply text to send',
-            },
-          },
-          required: ['groupName', 'messageId', 'message'],
-        },
-      },
+      ...(readOnly ? [] : writeTools),
     ],
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+
+    if (readOnly && (name === 'whatsapp_send_message' || name === 'whatsapp_reply_to_message')) {
+      return {
+        content: [{ type: 'text' as const, text: `${name} is disabled: the server runs with WHATSAPP_READ_ONLY=true.` }],
+        isError: true,
+      };
+    }
 
     // Retry helper — one automatic retry on transient errors (Puppeteer crashes,
     // WhatsApp Web flakiness). Waits 3s before retry to let the browser stabilize.

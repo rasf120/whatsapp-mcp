@@ -2,6 +2,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { getWhatsAppClient } from './whatsapp.js';
 import { registerTools } from './tools.js';
+import { loadPolicy, describePolicy } from './policy.js';
 
 function log(message: string): void {
   process.stderr.write(`[whatsapp-mcp] ${message}\n`);
@@ -17,7 +18,11 @@ function logError(message: string, error?: unknown): void {
 async function main(): Promise<void> {
   const sessionName = process.env.WHATSAPP_SESSION_NAME ?? 'default';
 
-  log(`Starting WhatsApp MCP server (session: ${sessionName})`);
+  const policy = loadPolicy();
+  log(`Starting WhatsApp MCP server (session: ${sessionName}; ${describePolicy(policy)})`);
+  if (policy.allowlist.length === 0) {
+    log('WARNING: WHATSAPP_GROUP_ALLOWLIST is empty. No groups will be exposed. Run `npm run pair` to list group names, then set the variable.');
+  }
 
   const server = new Server(
     { name: 'whatsapp-mcp', version: '1.0.0' },
@@ -25,7 +30,7 @@ async function main(): Promise<void> {
   );
 
   log('Initializing WhatsApp client...');
-  const client = getWhatsAppClient(sessionName);
+  const client = getWhatsAppClient(sessionName, policy);
 
   try {
     await client.initialize();
@@ -36,7 +41,10 @@ async function main(): Promise<void> {
   }
 
   registerTools(server, client);
-  log('MCP tools registered: whatsapp_list_groups, whatsapp_get_messages, whatsapp_export_chat, whatsapp_search_messages, whatsapp_group_info, whatsapp_send_message, whatsapp_reply_to_message');
+  log(
+    'MCP tools registered: whatsapp_list_groups, whatsapp_get_messages, whatsapp_export_chat, whatsapp_search_messages, whatsapp_group_info' +
+      (policy.readOnly ? ' (read-only: send/reply tools not registered)' : ', whatsapp_send_message, whatsapp_reply_to_message'),
+  );
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

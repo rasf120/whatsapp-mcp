@@ -9,6 +9,7 @@
     "dev": "tsx watch src/mcp-server/index.ts",
     "mcp:start": "tsx src/mcp-server/index.ts",
     "mcp:http": "tsx src/mcp-server/http-server.ts",
+    "pair": "tsx src/mcp-server/pair.ts",
     "test": "vitest run",
     "watch": "tsx scripts/watch-exports.ts"
   },
